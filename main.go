@@ -82,14 +82,27 @@ type Dashboard struct {
 }
 
 func main() {
+	// Setup log file
+	logFile, err := os.OpenFile("raspi-monitor.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
+	} else {
+		defer logFile.Close()
+		log.SetOutput(logFile)
+	}
+	
+	log.Println("=== Raspi Monitor Started ===")
+	
 	// Check if gpioget command is available (for Raspberry Pi 5)
 	gpioAvailable := false
 	
-	if _, err := exec.LookPath("gpioget"); err == nil {
+	// Check for gpioget at absolute path
+	if _, err := os.Stat("/usr/bin/gpioget"); err == nil {
 		gpioAvailable = true
 		log.Println("GPIO initialized successfully (using gpiochip0)")
 	} else {
-		log.Println("Warning: gpioget not found. Install with: sudo apt-get install gpiod")
+		log.Println("Warning: gpioget not found at /usr/bin/gpioget")
+		log.Println("Install with: sudo apt-get install gpiod")
 		log.Println("Running without button support.")
 	}
 
@@ -158,7 +171,7 @@ func (d *Dashboard) InitGPIO() {
 
 // readGPIOValue reads the current value of a GPIO pin using gpioget
 func readGPIOValue(pin int) int {
-	cmd := exec.Command("gpioget", "gpiochip0", fmt.Sprintf("%d", pin))
+	cmd := exec.Command("/usr/bin/gpioget", "gpiochip0", fmt.Sprintf("%d", pin))
 	output, err := cmd.Output()
 	if err != nil {
 		return 1 // Default to HIGH on error
