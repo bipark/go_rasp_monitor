@@ -15,7 +15,6 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
@@ -23,56 +22,39 @@ import (
 
 const (
 	updateInterval = time.Second
-	historySize    = 50
+	historySize    = 20
 )
 
-// ProcessInfo represents information about a single process
 type ProcessInfo struct {
-	PID         int32
-	Name        string
-	CPU         float64
-	Memory      float64
-	Status      string
-	Username    string
-	PPID        int32
-	Connections int
-	Ports       []uint32
+	PID      int32
+	Name     string
+	CPU      float64
+	Memory   float64
+	Status   string
+	Username string
 }
 
-// SystemStats holds all system statistics
 type SystemStats struct {
 	CPUPercent   []float64
 	MemPercent   float64
 	MemUsed      uint64
 	MemTotal     uint64
 	DiskPercent  float64
-	DiskUsed     uint64
-	DiskTotal    uint64
 	Temperature  float64
 	Uptime       uint64
 	NetSent      uint64
 	NetRecv      uint64
-	LoadAvg      []float64
 	ProcessCount uint64
 	AllProcesses []ProcessInfo
 }
 
-// Dashboard manages all UI widgets and state
 type Dashboard struct {
-	cpuGauge        *widgets.Gauge
-	memGauge        *widgets.Gauge
-	diskGauge       *widgets.Gauge
-	cpuChart        *widgets.SparklineGroup
-	infoList        *widgets.List
-	netList         *widgets.List
-	allProcessList  *widgets.List
+	mainList        *widgets.List
 	helpParagraph   *widgets.Paragraph
-
-	cpuHistory      []float64
+	currentView     int // 0: 시스템 정보, 1: 프로세스, 2: 네트워크
+	selectedProcess int
 	prevNetSent     uint64
 	prevNetRecv     uint64
-	cpuSparkline    *widgets.Sparkline
-	selectedProcess int
 }
 
 func main() {
@@ -92,150 +74,75 @@ func main() {
 	dashboard.EventLoop(ticker)
 }
 
-// NewDashboard creates a new dashboard instance
 func NewDashboard() *Dashboard {
 	return &Dashboard{
-		cpuHistory:      make([]float64, historySize),
+		currentView:     0,
 		selectedProcess: 0,
 	}
 }
 
-// InitWidgets initializes all UI widgets
 func (d *Dashboard) InitWidgets() {
-	d.cpuGauge = d.createGauge("CPU Usage", 0, 0, 50, 3, ui.ColorGreen)
-	d.memGauge = d.createGauge("Memory Usage", 0, 3, 50, 6, ui.ColorYellow)
-	d.diskGauge = d.createGauge("Disk Usage", 0, 6, 50, 9, ui.ColorCyan)
+	// Main list - full screen utilization
+	d.mainList = widgets.NewList()
+	d.mainList.Title = "System Monitor"
+	d.mainList.SetRect(0, 0, 30, 30) // 240x240 = approx 30x30 chars
+	d.mainList.TextStyle = ui.NewStyle(ui.ColorWhite)
+	d.mainList.BorderStyle = ui.NewStyle(ui.ColorCyan)
 
-	d.cpuSparkline = widgets.NewSparkline()
-	d.cpuSparkline.LineColor = ui.ColorGreen
-	d.cpuSparkline.TitleStyle.Fg = ui.ColorWhite
-	d.cpuChart = widgets.NewSparklineGroup(d.cpuSparkline)
-	d.cpuChart.Title = "CPU History"
-	d.cpuChart.SetRect(50, 0, 100, 9)
-
-	d.infoList = d.createList("System Information", 0, 9, 50, 20, ui.ColorCyan)
-	d.netList = d.createList("Network Statistics", 50, 9, 100, 20, ui.ColorMagenta)
-	
-	// All processes widget - bigger now
-	d.allProcessList = d.createList("All Processes (↑↓: Select & Scroll)", 0, 20, 100, 50, ui.ColorBlue)
-
+	// Bottom help - removed to save space
 	d.helpParagraph = widgets.NewParagraph()
-	d.helpParagraph.Title = "Controls"
-	d.helpParagraph.Text = "q: Quit | r: Refresh | ↑↓: Navigate Processes | PgUp/PgDn: Fast Scroll | Home: Top | End: Bottom"
-	d.helpParagraph.SetRect(0, 50, 100, 54)
+	d.helpParagraph.Title = ""
+	d.helpParagraph.Text = ""
+	d.helpParagraph.SetRect(0, 30, 30, 30)
 	d.helpParagraph.BorderStyle = ui.NewStyle(ui.ColorYellow)
 }
 
-// createGauge creates a gauge widget with the given parameters
-func (d *Dashboard) createGauge(title string, x1, y1, x2, y2 int, color ui.Color) *widgets.Gauge {
-	gauge := widgets.NewGauge()
-	gauge.Title = title
-	gauge.SetRect(x1, y1, x2, y2)
-	gauge.BarColor = color
-	gauge.LabelStyle = ui.NewStyle(ui.ColorWhite)
-	return gauge
-}
-
-// createList creates a list widget with the given parameters
-func (d *Dashboard) createList(title string, x1, y1, x2, y2 int, borderColor ui.Color) *widgets.List {
-	list := widgets.NewList()
-	list.Title = title
-	list.SetRect(x1, y1, x2, y2)
-	list.TextStyle = ui.NewStyle(ui.ColorWhite)
-	list.BorderStyle = ui.NewStyle(borderColor)
-	return list
-}
-
-// UpdateStats updates all system statistics and widgets
 func (d *Dashboard) UpdateStats() {
 	stats := getSystemStats()
 
-	d.updateCPUGauge(stats)
-	d.updateMemGauge(stats)
-	d.updateDiskGauge(stats)
-	d.updateCPUChart(stats)
-	d.updateSystemInfo(stats)
-	d.updateNetworkInfo(stats)
-	d.updateAllProcessList(stats)
+	switch d.currentView {
+	case 0:
+		d.updateSystemView(stats)
+	case 1:
+		d.updateProcessView(stats)
+	case 2:
+		d.updateNetworkView(stats)
+	}
 }
 
-// updateCPUGauge updates the CPU gauge widget
-func (d *Dashboard) updateCPUGauge(stats SystemStats) {
+func (d *Dashboard) updateSystemView(stats SystemStats) {
 	avgCPU := calculateAverage(stats.CPUPercent)
-	d.cpuGauge.Percent = int(avgCPU)
-	d.cpuGauge.Label = fmt.Sprintf("%.2f%%", avgCPU)
-	d.cpuGauge.BarColor = getColorByThreshold(avgCPU, 50, 80)
-}
-
-// updateMemGauge updates the memory gauge widget
-func (d *Dashboard) updateMemGauge(stats SystemStats) {
-	d.memGauge.Percent = int(stats.MemPercent)
-	d.memGauge.Label = fmt.Sprintf("%.2f%% (%.2f GB / %.2f GB)",
-		stats.MemPercent,
-		bytesToGB(stats.MemUsed),
-		bytesToGB(stats.MemTotal))
-	d.memGauge.BarColor = getColorByThreshold(stats.MemPercent, 50, 80)
-}
-
-// updateDiskGauge updates the disk gauge widget
-func (d *Dashboard) updateDiskGauge(stats SystemStats) {
-	d.diskGauge.Percent = int(stats.DiskPercent)
-	d.diskGauge.Label = fmt.Sprintf("%.2f%% (%.2f GB / %.2f GB)",
-		stats.DiskPercent,
-		bytesToGB(stats.DiskUsed),
-		bytesToGB(stats.DiskTotal))
-	d.diskGauge.BarColor = getColorByThreshold(stats.DiskPercent, 50, 80)
-}
-
-// updateCPUChart updates the CPU history chart
-func (d *Dashboard) updateCPUChart(stats SystemStats) {
-	avgCPU := calculateAverage(stats.CPUPercent)
-	d.cpuHistory = append(d.cpuHistory[1:], avgCPU)
-	d.cpuSparkline.Data = d.cpuHistory
-}
-
-// updateSystemInfo updates the system information list
-func (d *Dashboard) updateSystemInfo(stats SystemStats) {
-	days, hours, minutes := formatUptime(stats.Uptime)
-	loadAvgStr := formatLoadAverage(stats.LoadAvg)
+	days, hours, _ := formatUptime(stats.Uptime)
 	tempStr := formatTemperature(stats.Temperature)
 
-	d.infoList.Rows = []string{
-		fmt.Sprintf("[Hostname:](fg:cyan) %s", getHostname()),
-		fmt.Sprintf("[OS:](fg:cyan) %s", runtime.GOOS),
-		fmt.Sprintf("[Architecture:](fg:cyan) %s", runtime.GOARCH),
-		fmt.Sprintf("[CPU Cores:](fg:cyan) %d", runtime.NumCPU()),
-		fmt.Sprintf("[Temperature:](fg:cyan) %s", tempStr),
-		fmt.Sprintf("[Uptime:](fg:cyan) %dd %dh %dm", days, hours, minutes),
-		fmt.Sprintf("[Load Average:](fg:cyan) %s", loadAvgStr),
-		fmt.Sprintf("[Processes:](fg:cyan) %d", stats.ProcessCount),
+	d.mainList.Title = "System (1/3) [TAB:Switch q:Quit]"
+	d.mainList.Rows = []string{
+		"",
+		fmt.Sprintf("[CPU:](fg:cyan) %.1f%%", avgCPU),
+		getBar(avgCPU, 20),
+		"",
+		fmt.Sprintf("[MEM:](fg:yellow) %.1f%%", stats.MemPercent),
+		getBar(stats.MemPercent, 20),
+		"",
+		fmt.Sprintf("[DSK:](fg:magenta) %.1f%%", stats.DiskPercent),
+		getBar(stats.DiskPercent, 20),
+		"",
+		"[--System Info--](fg:white)",
+		fmt.Sprintf("Temp: %s", tempStr),
+		fmt.Sprintf("Uptime: %dd %dh", days, hours),
+		fmt.Sprintf("Cores: %d", runtime.NumCPU()),
+		fmt.Sprintf("Procs: %d", stats.ProcessCount),
+		"",
 	}
 }
 
-// updateNetworkInfo updates the network statistics list
-func (d *Dashboard) updateNetworkInfo(stats SystemStats) {
-	sentDiff := stats.NetSent - d.prevNetSent
-	recvDiff := stats.NetRecv - d.prevNetRecv
-	d.prevNetSent = stats.NetSent
-	d.prevNetRecv = stats.NetRecv
-
-	d.netList.Rows = []string{
-		fmt.Sprintf("[Total Sent:](fg:magenta) %.2f MB", bytesToMB(stats.NetSent)),
-		fmt.Sprintf("[Total Received:](fg:magenta) %.2f MB", bytesToMB(stats.NetRecv)),
-		fmt.Sprintf("[Upload Speed:](fg:magenta) %.2f KB/s", bytesToKB(sentDiff)),
-		fmt.Sprintf("[Download Speed:](fg:magenta) %.2f KB/s", bytesToKB(recvDiff)),
-	}
-}
-
-// updateAllProcessList updates the all process list widget with selection
-func (d *Dashboard) updateAllProcessList(stats SystemStats) {
+func (d *Dashboard) updateProcessView(stats SystemStats) {
 	totalProcesses := len(stats.AllProcesses)
 	if totalProcesses == 0 {
-		d.allProcessList.Rows = []string{"No processes found"}
+		d.mainList.Rows = []string{"No processes found"}
 		return
 	}
 
-	// Ensure selected process is within bounds
 	if d.selectedProcess >= totalProcesses {
 		d.selectedProcess = totalProcesses - 1
 	}
@@ -243,83 +150,77 @@ func (d *Dashboard) updateAllProcessList(stats SystemStats) {
 		d.selectedProcess = 0
 	}
 
-	d.allProcessList.Title = fmt.Sprintf("All Processes (Total: %d, Selected: %d)", totalProcesses, d.selectedProcess+1)
+	d.mainList.Title = fmt.Sprintf("Process (2/3) %d/%d [↑↓:Move]", d.selectedProcess+1, totalProcesses)
 
 	rows := []string{
-		fmt.Sprintf("[%-6s](fg:cyan) %-25s [%-6s](fg:red) [%-6s](fg:yellow) [%-3s](fg:white) [%-6s](fg:white) [%-6s](fg:white) [%-10s](fg:white)",
-			"PID", "Name", "CPU%", "Mem%", "St", "PPID", "Conns", "User"),
-		"─────────────────────────────────────────────────────────────────────────────────────────────────",
+		"[PID   Name         CPU%](fg:cyan)",
+		"---------------------------",
 	}
 
-	// Calculate visible range based on selection
-	visibleHeight := d.allProcessList.Inner.Dy() - 2 // Subtract header rows
-	if visibleHeight < 1 {
-		visibleHeight = 1
-	}
-
-	// Keep selected item in view
-	startIdx := 0
-	if d.selectedProcess >= visibleHeight {
-		startIdx = d.selectedProcess - visibleHeight + 1
-	}
-	endIdx := startIdx + visibleHeight
-
-	if endIdx > totalProcesses {
-		endIdx = totalProcesses
+	// Visible processes count (about 27 lines)
+	visibleHeight := 27
+	startIdx := d.selectedProcess
+	if startIdx > totalProcesses-visibleHeight {
+		startIdx = totalProcesses - visibleHeight
 	}
 	if startIdx < 0 {
 		startIdx = 0
 	}
+	endIdx := startIdx + visibleHeight
+	if endIdx > totalProcesses {
+		endIdx = totalProcesses
+	}
 
 	for i := startIdx; i < endIdx; i++ {
 		proc := stats.AllProcesses[i]
-		statusColor := getStatusColor(proc.Status)
+		name := truncateString(proc.Name, 12)
 		
-		// Highlight selected process
 		if i == d.selectedProcess {
 			rows = append(rows,
-				fmt.Sprintf("[[%-6d] [%-25s] [%-6.1f] [%-6.1f] [%-3s] [%-6d] [%-6d] [%-10s]](bg:white,fg:black)",
-					proc.PID,
-					truncateString(proc.Name, 25),
-					proc.CPU,
-					proc.Memory,
-					proc.Status,
-					proc.PPID,
-					proc.Connections,
-					truncateString(proc.Username, 10)))
+				fmt.Sprintf("[[%-5d] [%-12s] [%4.1f]](bg:white,fg:black)",
+					proc.PID, name, proc.CPU))
 		} else {
 			rows = append(rows,
-				fmt.Sprintf("[%-6d](fg:cyan) %-25s [%-6.1f](fg:red) [%-6.1f](fg:yellow) [%-3s](%s) [%-6d](fg:white) [%-6d](fg:white) [%-10s](fg:white)",
-					proc.PID,
-					truncateString(proc.Name, 25),
-					proc.CPU,
-					proc.Memory,
-					proc.Status,
-					statusColor,
-					proc.PPID,
-					proc.Connections,
-					truncateString(proc.Username, 10)))
+				fmt.Sprintf("[%-5d](fg:cyan) %-12s [%4.1f](fg:red)",
+					proc.PID, name, proc.CPU))
 		}
 	}
 
-	d.allProcessList.Rows = rows
+	d.mainList.Rows = rows
 }
 
-// Render renders all widgets
+func (d *Dashboard) updateNetworkView(stats SystemStats) {
+	sentDiff := stats.NetSent - d.prevNetSent
+	recvDiff := stats.NetRecv - d.prevNetRecv
+	d.prevNetSent = stats.NetSent
+	d.prevNetRecv = stats.NetRecv
+
+	d.mainList.Title = "Network (3/3) [TAB:Switch]"
+	d.mainList.Rows = []string{
+		"",
+		"[--Total Transfer--](fg:cyan)",
+		"",
+		fmt.Sprintf("Total Upload:"),
+		fmt.Sprintf("  %.1f MB", bytesToMB(stats.NetSent)),
+		"",
+		fmt.Sprintf("Total Download:"),
+		fmt.Sprintf("  %.1f MB", bytesToMB(stats.NetRecv)),
+		"",
+		"[--Current Speed--](fg:magenta)",
+		"",
+		fmt.Sprintf("Upload:"),
+		fmt.Sprintf("  %.1f KB/s", bytesToKB(sentDiff)),
+		"",
+		fmt.Sprintf("Download:"),
+		fmt.Sprintf("  %.1f KB/s", bytesToKB(recvDiff)),
+		"",
+	}
+}
+
 func (d *Dashboard) Render() {
-	ui.Render(
-		d.cpuGauge,
-		d.memGauge,
-		d.diskGauge,
-		d.cpuChart,
-		d.infoList,
-		d.netList,
-		d.allProcessList,
-		d.helpParagraph,
-	)
+	ui.Render(d.mainList)
 }
 
-// EventLoop handles UI events
 func (d *Dashboard) EventLoop(ticker *time.Ticker) {
 	uiEvents := ui.PollEvents()
 	stats := getSystemStats()
@@ -330,42 +231,25 @@ func (d *Dashboard) EventLoop(ticker *time.Ticker) {
 			switch e.ID {
 			case "q", "<C-c>":
 				return
-			case "r":
+			case "<Tab>":
+				d.currentView = (d.currentView + 1) % 3
 				d.UpdateStats()
 				d.Render()
 			case "<Up>":
-				if d.selectedProcess > 0 {
+				if d.currentView == 1 && d.selectedProcess > 0 {
 					d.selectedProcess--
+					d.UpdateStats()
 					d.Render()
 				}
 			case "<Down>":
-				stats = getSystemStats()
-				if d.selectedProcess < len(stats.AllProcesses)-1 {
-					d.selectedProcess++
-					d.Render()
+				if d.currentView == 1 {
+					stats = getSystemStats()
+					if d.selectedProcess < len(stats.AllProcesses)-1 {
+						d.selectedProcess++
+						d.UpdateStats()
+						d.Render()
+					}
 				}
-			case "<PageUp>":
-				d.selectedProcess -= 10
-				if d.selectedProcess < 0 {
-					d.selectedProcess = 0
-				}
-				d.Render()
-			case "<PageDown>":
-				stats = getSystemStats()
-				d.selectedProcess += 10
-				if d.selectedProcess >= len(stats.AllProcesses) {
-					d.selectedProcess = len(stats.AllProcesses) - 1
-				}
-				d.Render()
-			case "<Home>":
-				d.selectedProcess = 0
-				d.Render()
-			case "<End>":
-				stats = getSystemStats()
-				if len(stats.AllProcesses) > 0 {
-					d.selectedProcess = len(stats.AllProcesses) - 1
-				}
-				d.Render()
 			case "<Resize>":
 				d.handleResize(e.Payload.(ui.Resize))
 			}
@@ -376,28 +260,16 @@ func (d *Dashboard) EventLoop(ticker *time.Ticker) {
 	}
 }
 
-// handleResize handles terminal resize events
 func (d *Dashboard) handleResize(resize ui.Resize) {
 	width := resize.Width
 	height := resize.Height
-	halfWidth := width / 2
-
-	infoNetHeight := (height - 13) / 2
-
-	d.cpuGauge.SetRect(0, 0, halfWidth, 3)
-	d.memGauge.SetRect(0, 3, halfWidth, 6)
-	d.diskGauge.SetRect(0, 6, halfWidth, 9)
-	d.cpuChart.SetRect(halfWidth, 0, width, 9)
-	d.infoList.SetRect(0, 9, halfWidth, 9+infoNetHeight)
-	d.netList.SetRect(halfWidth, 9, width, 9+infoNetHeight)
-	d.allProcessList.SetRect(0, 9+infoNetHeight, width, height-4)
-	d.helpParagraph.SetRect(0, height-4, width, height)
-
+	
+	d.mainList.SetRect(0, 0, width, height)
+	
 	ui.Clear()
 	d.Render()
 }
 
-// getSystemStats collects all system statistics
 func getSystemStats() SystemStats {
 	stats := SystemStats{}
 
@@ -413,8 +285,6 @@ func getSystemStats() SystemStats {
 
 	if diskInfo, err := disk.Usage("/"); err == nil {
 		stats.DiskPercent = diskInfo.UsedPercent
-		stats.DiskUsed = diskInfo.Used
-		stats.DiskTotal = diskInfo.Total
 	}
 
 	stats.Temperature = getCPUTemperature()
@@ -422,10 +292,6 @@ func getSystemStats() SystemStats {
 	if hostInfo, err := host.Info(); err == nil {
 		stats.Uptime = hostInfo.Uptime
 		stats.ProcessCount = hostInfo.Procs
-	}
-
-	if loadAvg, err := load.Avg(); err == nil {
-		stats.LoadAvg = []float64{loadAvg.Load1, loadAvg.Load5, loadAvg.Load15}
 	}
 
 	if netStats, err := net.IOCounters(false); err == nil && len(netStats) > 0 {
@@ -438,7 +304,6 @@ func getSystemStats() SystemStats {
 	return stats
 }
 
-// getCPUTemperature reads CPU temperature from Raspberry Pi thermal zone
 func getCPUTemperature() float64 {
 	data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
 	if err != nil {
@@ -454,16 +319,6 @@ func getCPUTemperature() float64 {
 	return temp / 1000.0
 }
 
-// getHostname returns the system hostname
-func getHostname() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return hostname
-}
-
-// getAllProcesses returns all processes sorted by CPU usage
 func getAllProcesses() []ProcessInfo {
 	processes, err := process.Processes()
 	if err != nil {
@@ -482,8 +337,6 @@ func getAllProcesses() []ProcessInfo {
 		memInfo, _ := p.MemoryInfo()
 		status, _ := p.Status()
 		username, _ := p.Username()
-		ppid, _ := p.Ppid()
-		connections, _ := p.Connections()
 
 		memPercent := 0.0
 		if memInfo != nil && totalMem.Total > 0 {
@@ -495,32 +348,18 @@ func getAllProcesses() []ProcessInfo {
 			statusStr = string(status[0])
 		}
 
-		// Extract ports from connections
-		var ports []uint32
-		portMap := make(map[uint32]bool)
-		for _, conn := range connections {
-			if conn.Laddr.Port > 0 && !portMap[conn.Laddr.Port] {
-				ports = append(ports, conn.Laddr.Port)
-				portMap[conn.Laddr.Port] = true
-			}
-		}
-
 		procInfo := ProcessInfo{
-			PID:         p.Pid,
-			Name:        name,
-			CPU:         cpuPercent,
-			Memory:      memPercent,
-			Status:      statusStr,
-			Username:    username,
-			PPID:        ppid,
-			Connections: len(connections),
-			Ports:       ports,
+			PID:      p.Pid,
+			Name:     name,
+			CPU:      cpuPercent,
+			Memory:   memPercent,
+			Status:   statusStr,
+			Username: username,
 		}
 
 		processInfos = append(processInfos, procInfo)
 	}
 
-	// Sort by CPU usage
 	sort.Slice(processInfos, func(i, j int) bool {
 		return processInfos[i].CPU > processInfos[j].CPU
 	})
@@ -541,30 +380,14 @@ func calculateAverage(values []float64) float64 {
 	return sum / float64(len(values))
 }
 
-func getColorByThreshold(value, mediumThreshold, highThreshold float64) ui.Color {
-	if value > highThreshold {
-		return ui.ColorRed
-	} else if value > mediumThreshold {
-		return ui.ColorYellow
+func getBar(percent float64, width int) string {
+	filled := int(percent / 100.0 * float64(width))
+	if filled > width {
+		filled = width
 	}
-	return ui.ColorGreen
-}
-
-func getStatusColor(status string) string {
-	switch status {
-	case "R":
-		return "fg:green"
-	case "S":
-		return "fg:yellow"
-	case "Z":
-		return "fg:red"
-	default:
-		return "fg:white"
-	}
-}
-
-func bytesToGB(bytes uint64) float64 {
-	return float64(bytes) / 1024 / 1024 / 1024
+	bar := strings.Repeat("█", filled)
+	empty := strings.Repeat("░", width-filled)
+	return fmt.Sprintf("[%s%s](fg:green)", bar, empty)
 }
 
 func bytesToMB(bytes uint64) float64 {
@@ -582,13 +405,6 @@ func formatUptime(uptime uint64) (days, hours, minutes uint64) {
 	return
 }
 
-func formatLoadAverage(loadAvg []float64) string {
-	if len(loadAvg) >= 3 {
-		return fmt.Sprintf("%.2f, %.2f, %.2f", loadAvg[0], loadAvg[1], loadAvg[2])
-	}
-	return "N/A"
-}
-
 func formatTemperature(temp float64) string {
 	if temp > 0 {
 		return fmt.Sprintf("%.1f°C", temp)
@@ -600,5 +416,5 @@ func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	return s[:maxLen-2] + ".."
 }
