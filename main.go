@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"runtime"
 	"sort"
 	"strconv"
@@ -16,13 +17,30 @@ import (
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
-	"github.com/shirou/gopsutil/v3/net"
+	gopsnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
+	"net"
 )
 
 const (
 	updateInterval = time.Second
 	historySize    = 20
+	
+	// GPIO Pin definitions for buttons (BCM numbering)
+	// Based on your hardware configuration
+	buttonUp     = 3   // KEY1 - Up
+	buttonDown   = 5   // KEY2 - Down
+	buttonLeft   = 6   // KEY3 - Left
+	buttonRight  = 16  // KEY4 - Right
+	buttonA      = 13  // KEY5 - A button
+	buttonB      = 26  // KEY6 - B button
+	buttonX      = 19  // KEY7 - X button
+	buttonY      = 21  // KEY8 - Y button
+	buttonStart  = 20  // KEY9 - Start
+	buttonSelect = 15  // KEY10 - Select
+	buttonL      = 12  // KEY11 - L button
+	buttonR      = 14  // KEY12 - R button
+	buttonCenter = 23  // KEY13 - Center/Menu
 )
 
 type ProcessInfo struct {
@@ -46,18 +64,35 @@ type SystemStats struct {
 	NetRecv      uint64
 	ProcessCount uint64
 	AllProcesses []ProcessInfo
+	IPAddress    string
+	APMode       string
 }
 
 type Dashboard struct {
 	mainList        *widgets.List
 	helpParagraph   *widgets.Paragraph
-	currentView     int // 0: 시스템 정보, 1: 프로세스, 2: 네트워크
+	currentView     int // 0: System info, 1: Process, 2: Network
 	selectedProcess int
 	prevNetSent     uint64
 	prevNetRecv     uint64
+	
+	// Button press tracking
+	lastButtonState map[int]int
+	gpioEnabled     bool // Track if GPIO is available
 }
 
 func main() {
+	// Check if gpioget command is available (for Raspberry Pi 5)
+	gpioAvailable := false
+	
+	if _, err := exec.LookPath("gpioget"); err == nil {
+		gpioAvailable = true
+		log.Println("GPIO initialized successfully (using gpiochip0)")
+	} else {
+		log.Println("Warning: gpioget not found. Install with: sudo apt-get install gpiod")
+		log.Println("Running without button support.")
+	}
+
 	if err := ui.Init(); err != nil {
 		log.Fatalf("failed to initialize termui: %v", err)
 	}
@@ -65,6 +100,11 @@ func main() {
 
 	dashboard := NewDashboard()
 	dashboard.InitWidgets()
+	if gpioAvailable {
+		dashboard.InitGPIO()
+	} else {
+		log.Println("Button controls disabled. Use keyboard: TAB=switch, q=quit, arrows=navigate")
+	}
 	dashboard.UpdateStats()
 	dashboard.Render()
 
@@ -78,6 +118,8 @@ func NewDashboard() *Dashboard {
 	return &Dashboard{
 		currentView:     0,
 		selectedProcess: 0,
+		lastButtonState: make(map[int]int),
+		gpioEnabled:     false,
 	}
 }
 
@@ -95,6 +137,38 @@ func (d *Dashboard) InitWidgets() {
 	d.helpParagraph.Text = ""
 	d.helpParagraph.SetRect(0, 30, 30, 30)
 	d.helpParagraph.BorderStyle = ui.NewStyle(ui.ColorYellow)
+}
+
+// InitGPIO initializes GPIO pins for button input using gpioget
+func (d *Dashboard) InitGPIO() {
+	log.Println("Initializing GPIO pins via gpiochip0...")
+	
+	// Initialize last button states (all HIGH/1 initially with pull-up)
+	pins := []int{buttonUp, buttonDown, buttonLeft, buttonRight, 
+		buttonA, buttonB, buttonX, buttonY, 
+		buttonStart, buttonSelect, buttonL, buttonR, buttonCenter}
+	
+	for _, pin := range pins {
+		d.lastButtonState[pin] = 1 // HIGH = not pressed
+	}
+	
+	d.gpioEnabled = true
+	log.Println("GPIO ready - press buttons to test")
+}
+
+// readGPIOValue reads the current value of a GPIO pin using gpioget
+func readGPIOValue(pin int) int {
+	cmd := exec.Command("gpioget", "gpiochip0", fmt.Sprintf("%d", pin))
+	output, err := cmd.Output()
+	if err != nil {
+		return 1 // Default to HIGH on error
+	}
+	
+	value := strings.TrimSpace(string(output))
+	if value == "0" {
+		return 0 // LOW = pressed
+	}
+	return 1 // HIGH = not pressed
 }
 
 func (d *Dashboard) UpdateStats() {
@@ -115,7 +189,7 @@ func (d *Dashboard) updateSystemView(stats SystemStats) {
 	days, hours, _ := formatUptime(stats.Uptime)
 	tempStr := formatTemperature(stats.Temperature)
 
-	d.mainList.Title = "System (1/3) [TAB:Switch q:Quit]"
+	d.mainList.Title = "System (1/3) [A/B:Switch]"
 	d.mainList.Rows = []string{
 		"",
 		fmt.Sprintf("[CPU:](fg:cyan) %.1f%%", avgCPU),
@@ -132,6 +206,10 @@ func (d *Dashboard) updateSystemView(stats SystemStats) {
 		fmt.Sprintf("Uptime: %dd %dh", days, hours),
 		fmt.Sprintf("Cores: %d", runtime.NumCPU()),
 		fmt.Sprintf("Procs: %d", stats.ProcessCount),
+		"",
+		"[--Network Info--](fg:green)",
+		fmt.Sprintf("IP: %s", stats.IPAddress),
+		fmt.Sprintf("Mode: %s", stats.APMode),
 		"",
 	}
 }
@@ -195,7 +273,7 @@ func (d *Dashboard) updateNetworkView(stats SystemStats) {
 	d.prevNetSent = stats.NetSent
 	d.prevNetRecv = stats.NetRecv
 
-	d.mainList.Title = "Network (3/3) [TAB:Switch]"
+	d.mainList.Title = "Network (3/3) [A/B:Switch]"
 	d.mainList.Rows = []string{
 		"",
 		"[--Total Transfer--](fg:cyan)",
@@ -294,12 +372,14 @@ func getSystemStats() SystemStats {
 		stats.ProcessCount = hostInfo.Procs
 	}
 
-	if netStats, err := net.IOCounters(false); err == nil && len(netStats) > 0 {
+	if netStats, err := gopsnet.IOCounters(false); err == nil && len(netStats) > 0 {
 		stats.NetSent = netStats[0].BytesSent
 		stats.NetRecv = netStats[0].BytesRecv
 	}
 
 	stats.AllProcesses = getAllProcesses()
+	stats.IPAddress = getIPAddress()
+	stats.APMode = getAPMode()
 
 	return stats
 }
@@ -417,4 +497,70 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-2] + ".."
+}
+
+// getIPAddress returns the current IP address
+func getIPAddress() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "N/A"
+	}
+
+	for _, iface := range interfaces {
+		// Skip loopback and down interfaces
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			// Return first non-loopback IPv4 address
+			if ipNet.IP.To4() != nil {
+				return ipNet.IP.String()
+			}
+		}
+	}
+
+	return "No IP"
+}
+
+// getAPMode checks if the system is in AP mode
+func getAPMode() string {
+	// Check for hostapd process (common AP mode daemon)
+	processes, err := process.Processes()
+	if err != nil {
+		return "Unknown"
+	}
+
+	for _, p := range processes {
+		name, err := p.Name()
+		if err != nil {
+			continue
+		}
+		
+		if strings.Contains(strings.ToLower(name), "hostapd") {
+			return "AP Mode"
+		}
+	}
+
+	// Check for wlan0 in master mode (alternative check)
+	data, err := os.ReadFile("/sys/class/net/wlan0/operstate")
+	if err == nil {
+		state := strings.TrimSpace(string(data))
+		if state == "up" {
+			// Additional check for AP mode via iwconfig or similar
+			return "Client Mode"
+		}
+	}
+
+	return "Client Mode"
 }
